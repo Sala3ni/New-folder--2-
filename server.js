@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const path = require('path');
+const session = require('express-session');
 require('dotenv').config();
 
 const app = express();
@@ -23,9 +24,18 @@ async function initDB() {
         ttl_seconds INTEGER,
         max_views INTEGER,
         created_at BIGINT NOT NULL,
+        expires_at BIGINT,
         views INTEGER DEFAULT 0
       )
     `);
+    
+    // Add expires_at column if it doesn't exist
+    try {
+      await pool.query('ALTER TABLE pastes ADD COLUMN IF NOT EXISTS expires_at BIGINT');
+    } catch (err) {
+      // Column might already exist, ignore error
+    }
+    
     console.log('Database initialized');
   } catch (err) {
     console.error('Database initialization error:', err);
@@ -36,6 +46,12 @@ initDB();
 
 app.use(cors());
 app.use(express.json());
+app.use(session({
+  secret: 'pastebin-secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { maxAge: 24 * 60 * 60 * 1000 } // 24 hours
+}));
 app.use(express.static(path.join(__dirname, 'build')));
 
 function getCurrentTime(req) {
@@ -68,6 +84,11 @@ app.post('/api/pastes', async (req, res) => {
       return res.status(400).json({ error: 'Content is required and must be a non-empty string' });
     }
 
+    // Require at least one constraint (TTL or max views)
+    if (!ttl_seconds && !max_views) {
+      return res.status(400).json({ error: 'At least one constraint (ttl_seconds or max_views) is required' });
+    }
+
     if (ttl_seconds !== undefined && (!Number.isInteger(ttl_seconds) || ttl_seconds < 1)) {
       return res.status(400).json({ error: 'ttl_seconds must be an integer >= 1' });
     }
@@ -78,10 +99,11 @@ app.post('/api/pastes', async (req, res) => {
 
     const id = generateId();
     const currentTime = getCurrentTime(req);
+    // Don't set expires_at during creation, set it on first access
     
     await pool.query(
-      'INSERT INTO pastes (id, content, ttl_seconds, max_views, created_at, views) VALUES ($1, $2, $3, $4, $5, $6)',
-      [id, content, ttl_seconds, max_views, currentTime, 0]
+      'INSERT INTO pastes (id, content, ttl_seconds, max_views, created_at, expires_at, views) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [id, content, ttl_seconds, max_views, currentTime, null, 0]
     );
 
     const url = `${req.protocol}://${req.get('host')}/p/${id}`;
@@ -105,8 +127,15 @@ app.get('/api/pastes/:id', async (req, res) => {
 
     const paste = result.rows[0];
 
-    // Check TTL expiry
-    if (paste.ttl_seconds && currentTime > paste.created_at + (paste.ttl_seconds * 1000)) {
+    // Always set new expires_at on every access if TTL is set
+    if (paste.ttl_seconds) {
+      const expiresAt = currentTime + (paste.ttl_seconds * 1000);
+      await pool.query('UPDATE pastes SET expires_at = $1 WHERE id = $2', [expiresAt, id]);
+      paste.expires_at = expiresAt;
+    }
+
+    // Check TTL expiry using stored expires_at (this won't trigger on same request)
+    if (paste.expires_at && currentTime > paste.expires_at) {
       return res.status(404).json({ error: 'Paste expired' });
     }
 
@@ -121,7 +150,7 @@ app.get('/api/pastes/:id', async (req, res) => {
     const response = {
       content: paste.content,
       remaining_views: paste.max_views ? paste.max_views - (paste.views + 1) : null,
-      expires_at: paste.ttl_seconds ? new Date(paste.created_at + (paste.ttl_seconds * 1000)).toISOString() : null
+      expires_at: paste.expires_at ? new Date(paste.expires_at).toISOString() : null
     };
 
     res.json(response);
@@ -134,7 +163,7 @@ app.get('/api/pastes/:id', async (req, res) => {
 app.get('/p/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const currentTime = getCurrentTime(req);  // Fixed: use getCurrentTime instead of Date.now()
+    const currentTime = getCurrentTime(req);
     
     const result = await pool.query('SELECT * FROM pastes WHERE id = $1', [id]);
     
@@ -154,8 +183,15 @@ app.get('/p/:id', async (req, res) => {
 
     const paste = result.rows[0];
 
-    // Check TTL expiry
-    if (paste.ttl_seconds && currentTime > paste.created_at + (paste.ttl_seconds * 1000)) {
+    // Always set new expires_at on every access if TTL is set
+    if (paste.ttl_seconds) {
+      const expiresAt = currentTime + (paste.ttl_seconds * 1000);
+      await pool.query('UPDATE pastes SET expires_at = $1 WHERE id = $2', [expiresAt, id]);
+      paste.expires_at = expiresAt;
+    }
+
+    // Check TTL expiry using stored expires_at (this won't trigger on same request)
+    if (paste.expires_at && currentTime > paste.expires_at) {
       return res.status(404).send(`
         <html>
           <head><title>Paste Expired</title></head>
@@ -169,8 +205,13 @@ app.get('/p/:id', async (req, res) => {
       `);
     }
 
-    // Check view limit
-    if (paste.max_views && paste.views >= paste.max_views) {
+    // Always increment view count first
+    await pool.query('UPDATE pastes SET views = views + 1 WHERE id = $1', [id]);
+    
+    const newViews = paste.views + 1;
+    
+    // Check view limit AFTER incrementing
+    if (paste.max_views && newViews > paste.max_views) {
       return res.status(404).send(`
         <html>
           <head><title>View Limit Exceeded</title></head>
@@ -183,8 +224,11 @@ app.get('/p/:id', async (req, res) => {
         </html>
       `);
     }
-
+    
     const content = paste.content.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    
+    // Calculate remaining time using stored expires_at
+    const remainingMs = paste.expires_at ? Math.max(0, paste.expires_at - currentTime) : null;
     
     res.send(`
       <html>
@@ -200,16 +244,54 @@ app.get('/p/:id', async (req, res) => {
 ${content}
             </div>
             <div style="margin-top: 10px; font-size: 12px; color: #666;">
-              ${paste.max_views ? `Views remaining: ${paste.max_views - paste.views} ` : ''}
-              ${paste.ttl_seconds ? `Expires: ${new Date(paste.created_at + (paste.ttl_seconds * 1000)).toLocaleString()}` : ''}
+              ${paste.max_views ? `Views: ${newViews}/${paste.max_views} ` : ''}
+              ${paste.expires_at ? `<span id="timer">Expires in: ${Math.ceil(remainingMs / 1000)}s</span>` : ''}
             </div>
           </div>
+          ${paste.expires_at ? `
+          <script>
+            const expiresAt = ${paste.expires_at};
+            const createdAt = ${paste.created_at};
+            const timer = document.getElementById('timer');
+            
+            function updateTimer() {
+              const now = Date.now();
+              const remaining = Math.max(0, expiresAt - now);
+              
+              if (remaining <= 0) {
+                timer.textContent = 'Expired!';
+                setTimeout(() => location.reload(), 1000);
+              } else {
+                timer.textContent = 'Expires in: ' + Math.ceil(remaining / 1000) + 's';
+                setTimeout(updateTimer, 1000);
+              }
+            }
+            
+            // Start timer immediately when page loads
+            updateTimer();
+          </script>
+          ` : ''}
         </body>
       </html>
-    `);
-  } catch (error) {
+    `);  } catch (error) {
     res.status(500).send('Internal server error');
   }
+});
+
+// Expired page
+app.get('/expired', (req, res) => {
+  res.send(`
+    <html>
+      <head><title>Paste Expired</title></head>
+      <body style="font-family: monospace; margin: 20px; background: #f5f5f5;">
+        <div style="max-width: 800px; margin: 0 auto; text-align: center;">
+          <h1>⏰ Paste Expired</h1>
+          <p>This paste has expired and is no longer available.</p>
+          <a href="/" style="color: #007bff; text-decoration: none;">← Create New Paste</a>
+        </div>
+      </body>
+    </html>
+  `);
 });
 
 // Serve React app

@@ -15,6 +15,13 @@ function App() {
     setError('');
     setResult(null);
 
+    // Validate at least one constraint
+    if (!ttlSeconds && !maxViews) {
+      setError('Please set at least one constraint (expire time or max views)');
+      setLoading(false);
+      return;
+    }
+
     try {
       const body = { content };
       
