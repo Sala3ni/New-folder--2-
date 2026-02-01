@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "react-scripts start",
     "build": "react-scripts build",
-    "start": "concurrently \"npm run server\" \"npm run dev\"",
+    "start": "node server.js",
     "server": "node server.js",
+    "vercel-build": "react-scripts build",
     "test": "react-scripts test"
   },
   "dependencies": {
